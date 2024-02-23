@@ -6,134 +6,86 @@ import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 contract NFTMarketplace is ERC721Holder, Ownable {
-    uint256 public feePercentage;   // Fee percentage to be set by the marketplace owner
-    uint256 private constant PERCENTAGE_BASE = 100;
-
-    struct Listing {
+    // State variables and data structures for the auction functionality
+    struct Auction {
         address seller;
-        uint256 price;
+        address highestBidder;
+        uint256 highestBid;
+        uint256 endTime;
         bool isActive;
     }
 
-    struct Escrow {
-        address buyer;
-        uint256 amount;
-        bool isFunded;
-        bool isReleased;
-    }
+    mapping(address => mapping(uint256 => Auction)) private auctions;
 
-    mapping(address => mapping(uint256 => Listing)) private listings;
-    mapping(address => mapping(uint256 => Escrow)) private escrows;
+    event NFTAuctionStarted(address indexed seller, uint256 indexed tokenId, uint256 startingPrice, uint256 endTime);
+    event NFTBidPlaced(address indexed bidder, uint256 indexed tokenId, uint256 amount);
+    event NFTAuctionEnded(address indexed seller, address indexed winner, uint256 indexed tokenId, uint256 amount);
 
-    event NFTListed(address indexed seller, uint256 indexed tokenId, uint256 price);
-    event NFTSold(address indexed seller, address indexed buyer, uint256 indexed tokenId, uint256 price);
-    event NFTPriceChanged(address indexed seller, uint256 indexed tokenId, uint256 newPrice);
-    event NFTUnlisted(address indexed seller, uint256 indexed tokenId);
-    event EscrowFunded(address indexed buyer, uint256 indexed tokenId, uint256 amount);
-    event EscrowReleased(address indexed seller, address indexed buyer, uint256 indexed tokenId, uint256 amount);
-
-    constructor() {
-        feePercentage = 2;  // Setting the default fee percentage to 2%
-    }
-
-    // Function to list an NFT for sale
-    function listNFT(address nftContract, uint256 tokenId, uint256 price) external {
-        require(price > 0, "Price must be greater than zero");
-
+    // Function to start an auction for an NFT
+    function startAuction(address nftContract, uint256 tokenId, uint256 startingPrice, uint256 duration) external {
         // Transfer the NFT from the seller to the marketplace contract
         IERC721(nftContract).safeTransferFrom(msg.sender, address(this), tokenId);
 
-        // Create a new listing
-        listings[nftContract][tokenId] = Listing({
+        // Set up the auction details
+        auctions[nftContract][tokenId] = Auction({
             seller: msg.sender,
-            price: price,
+            highestBidder: address(0),
+            highestBid: startingPrice,
+            endTime: block.timestamp + duration,
             isActive: true
         });
 
-        emit NFTListed(msg.sender, tokenId, price);
+        emit NFTAuctionStarted(msg.sender, tokenId, startingPrice, auctions[nftContract][tokenId].endTime);
     }
 
-    // Function to buy an NFT listed on the marketplace
-    function buyNFT(address nftContract, uint256 tokenId) external payable {
-        Listing storage listing = listings[nftContract][tokenId];
-        require(listing.isActive, "NFT is not listed for sale");
-        require(msg.value >= listing.price, "Insufficient payment");
+    // Function for users to place a bid on an ongoing auction
+    function placeBid(address nftContract, uint256 tokenId) external payable {
+        Auction storage auction = auctions[nftContract][tokenId];
+        require(auction.isActive, "Auction is not active");
+        require(block.timestamp < auction.endTime, "Auction has ended");
+        require(msg.value > auction.highestBid, "Bid must be higher than current highest bid");
 
-        // Create an escrow for the buyer
-        escrows[nftContract][tokenId] = Escrow({
-            buyer: msg.sender,
-            amount: msg.value,
-            isFunded: true,
-            isReleased: false
-        });
+        // Refund the previous highest bidder
+        if (auction.highestBidder != address(0)) {
+            payable(auction.highestBidder).transfer(auction.highestBid);
+        }
 
-        emit EscrowFunded(msg.sender, tokenId, msg.value);
+        // Update the highest bidder and bid amount
+        auction.highestBidder = msg.sender;
+        auction.highestBid = msg.value;
+
+        emit NFTBidPlaced(msg.sender, tokenId, msg.value);
     }
 
-    // Function for the seller to release funds from escrow after buyer confirms receipt
-    function releaseEscrow(address nftContract, uint256 tokenId) external {
-        Escrow storage escrow = escrows[nftContract][tokenId];
-        require(escrow.buyer == msg.sender, "You are not the buyer");
-        require(escrow.isFunded, "Escrow is not funded");
-        require(!escrow.isReleased, "Escrow has already been released");
+    // Function to end an auction and transfer the NFT to the highest bidder
+    function endAuction(address nftContract, uint256 tokenId) external {
+        Auction storage auction = auctions[nftContract][tokenId];
+        require(auction.isActive, "Auction is not active");
+        require(block.timestamp >= auction.endTime, "Auction is ongoing");
 
-        // Transfer the funds to the seller
-        payable(listings[nftContract][tokenId].seller).transfer(escrow.amount);
+        // Transfer the NFT to the highest bidder
+        IERC721(nftContract).safeTransferFrom(address(this), auction.highestBidder, tokenId);
 
-        // Mark the escrow as released
-        escrow.isReleased = true;
+        // Transfer the funds from the highest bidder to the seller after deducting the fee
+        uint256 fee = (auction.highestBid * feePercentage) / PERCENTAGE_BASE;
+        uint256 sellerAmount = auction.highestBid - fee;
 
-        // Transfer the NFT from the marketplace contract to the buyer
-        IERC721(nftContract).safeTransferFrom(address(this), escrow.buyer, tokenId);
+        payable(auction.seller).transfer(sellerAmount);
 
-        // Update the listing
-        listings[nftContract][tokenId].isActive = false;
+        // End the auction and update state
+        auction.isActive = false;
 
-        emit NFTSold(listings[nftContract][tokenId].seller, escrow.buyer, tokenId, listings[nftContract][tokenId].price);
-        emit EscrowReleased(listings[nftContract][tokenId].seller, escrow.buyer, tokenId, escrow.amount);
-    }
-
-    // Function to change the price of a listed NFT
-    function changePrice(address nftContract, uint256 tokenId, uint256 newPrice) external {
-        require(newPrice > 0, "Price must be greater than zero");
-        require(listings[nftContract][tokenId].seller == msg.sender, "You are not the seller");
-
-        listings[nftContract][tokenId].price = newPrice;
-
-        emit NFTPriceChanged(msg.sender, tokenId, newPrice);
-    }
-
-    // Function to unlist a listed NFT
-    function unlistNFT(address nftContract, uint256 tokenId) external {
-        require(listings[nftContract][tokenId].seller == msg.sender, "You are not the seller");
-
-        delete listings[nftContract][tokenId];
-
-        // Transfer the NFT back to the seller
-        IERC721(nftContract).safeTransferFrom(address(this), msg.sender, tokenId);
-
-        emit NFTUnlisted(msg.sender, tokenId);
-    }
-
-    // Function to set the fee percentage by the marketplace owner
-    function setFeePercentage(uint256 newFeePercentage) external onlyOwner {
-        require(newFeePercentage < PERCENTAGE_BASE, "Fee percentage must be less than 100");
-
-        feePercentage = newFeePercentage;
+        emit NFTAuctionEnded(auction.seller, auction.highestBidder, tokenId, auction.highestBid);
     }
 
     // Additional feature ideas:
     // {
-    //     "short_name": "Auction",
-    //     "description": "Implement an auction functionality where users can bid and the highest bidder wins."
-    // },
-    // {
     //     "short_name": "Statistics",
-    //     "description": "Track statistics of the listings and sales of NFTs on the marketplace."
+    //     "description": "Track statistics of the listings, sales, and auction results of NFTs on the marketplace."
     // },
     // {
     //     "short_name": "Rating & Reviews",
-    //     "description": "Introduce a rating and review system for buyers and sellers on the platform."
+    //     "description": "Introduce a rating and review system for buyers and sellers in the marketplace."
     // },
     // {
     //     "short_name": "Multiple Currencies",
@@ -142,5 +94,13 @@ contract NFTMarketplace is ERC721Holder, Ownable {
     // {
     //     "short_name": "Escrow Timeouts",
     //     "description": "Implement escrow timeouts where funds are released if no action is taken within a set period."
+    // },
+    // {
+    //     "short_name": "Instant Buy",
+    //     "description": "Allow users to instantly purchase NFTs at a fixed price without auctions."
+    // }
+    // {
+    //     "short_name": "Customizable Auction Parameters",
+    //     "description": "Allow sellers to set custom parameters for the auction such as starting price, duration, etc."
     // }
 }
